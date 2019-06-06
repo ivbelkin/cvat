@@ -51,11 +51,13 @@ services:
         WITH_TESTS: "no"
     environment:
       DJANGO_MODWSGI_EXTRA_ARGS: ""
+      CVAT_SHARE_URL: "Mounted from host directory"
     volumes:
       - cvat_data:/home/django/data
       - cvat_keys:/home/django/keys
       - cvat_logs:/home/django/logs
       - cvat_models:/home/django/models
+      - cvat_share:/home/django/share:ro
 
 volumes:
   cvat_db:
@@ -63,3 +65,8 @@ volumes:
   cvat_keys:
   cvat_logs:
   cvat_models:
+  cvat_share:
+    driver_opts:
+      type: none
+      device: <local path>
+      o: bind

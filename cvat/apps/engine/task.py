@@ -24,10 +24,13 @@ from django.conf import settings
 from django.db import transaction
 from ffmpy import FFmpeg
 from pyunpack import Archive
-from distutils.dir_util import copy_tree
 
 from . import models
 from .log import slogger
+
+from distutils import log
+from distutils.errors import DistutilsFileError
+from distutils.dir_util import mkpath, sysconfig
 
 ############################# Low Level server API
 
@@ -161,7 +164,7 @@ def _get_mime(name):
 
 def _copy_data_from_share(server_files, upload_dir):
     job = rq.get_current_job()
-    job.meta['status'] = 'Data are being copied from share..'
+    job.meta['status'] = 'Data are being linked from share..'
     job.save_meta()
 
     for path in server_files:
@@ -173,7 +176,7 @@ def _copy_data_from_share(server_files, upload_dir):
             target_dir = os.path.dirname(target_path)
             if not os.path.exists(target_dir):
                 os.makedirs(target_dir)
-            shutil.copyfile(source_path, target_path)
+            os.symlink(source_path, target_path)
 
 def _unpack_archive(archive, upload_dir):
     job = rq.get_current_job()
@@ -218,7 +221,7 @@ def _copy_images_to_task(upload_dir, db_task):
         job = rq.get_current_job()
         for frame, image_orig_path in enumerate(image_paths):
             progress = frame * 100 // len(image_paths)
-            job.meta['status'] = 'Images are being compressed.. {}%'.format(progress)
+            job.meta['status'] = 'Images are being processed.. {}%'.format(progress)
             job.save_meta()
             image_dest_path = db_task.get_frame_path(frame)
             db_task.size += 1
@@ -227,14 +230,8 @@ def _copy_images_to_task(upload_dir, db_task):
                 os.makedirs(dirname)
             image = Image.open(image_orig_path)
             # Ensure image data fits into 8bit per pixel before RGB conversion as PIL clips values on conversion
-            if image.mode == "I":
-                # Image mode is 32bit integer pixels.
-                # Autoscale pixels by factor 2**8 / im_data.max() to fit into 8bit
-                im_data = np.array(image)
-                im_data = im_data * (2**8 / im_data.max())
-                image = Image.fromarray(im_data.astype(np.int32))
-            image = image.convert('RGB')
-            image.save(image_dest_path, quality=db_task.image_quality, optimize=True)
+            assert image.mode == "RGB", "Image should be in RGB mode"
+            shutil.copy(image_orig_path, image_dest_path, follow_symlinks=False)
             db_images.append(models.Image(task=db_task, path=image_orig_path,
                 frame=frame, width=image.width, height=image.height))
             image.close()
@@ -374,3 +371,81 @@ def _create_thread(tid, data):
     slogger.glob.info("Founded frames {} for task #{}".format(db_task.size, tid))
     _save_task_to_db(db_task)
 
+def copy_tree(src, dst, preserve_mode=1, preserve_times=1,
+              preserve_symlinks=0, update=0, verbose=1, dry_run=0):
+    """Copy an entire directory tree 'src' to a new location 'dst'.
+
+    Both 'src' and 'dst' must be directory names.  If 'src' is not a
+    directory, raise DistutilsFileError.  If 'dst' does not exist, it is
+    created with 'mkpath()'.  The end result of the copy is that every
+    file in 'src' is copied to 'dst', and directories under 'src' are
+    recursively copied to 'dst'.  Return the list of files that were
+    copied or might have been copied, using their output name.  The
+    return value is unaffected by 'update' or 'dry_run': it is simply
+    the list of all files under 'src', with the names changed to be
+    under 'dst'.
+
+    'preserve_mode' and 'preserve_times' are the same as for
+    'copy_file'; note that they only apply to regular files, not to
+    directories.  If 'preserve_symlinks' is true, symlinks will be
+    copied as symlinks (on platforms that support them!); otherwise
+    (the default), the destination of the symlink will be copied.
+    'update' and 'verbose' are the same as for 'copy_file'.
+    """
+    from distutils.file_util import copy_file
+
+    if not dry_run and not os.path.isdir(src):
+        raise DistutilsFileError(
+              "cannot copy tree '%s': not a directory" % src)
+    try:
+        names = os.listdir(src)
+    except OSError as e:
+        if dry_run:
+            names = []
+        else:
+            raise DistutilsFileError(
+                  "error listing files in '%s': %s" % (src, e.strerror))
+
+    ext_suffix = sysconfig.get_config_var ('EXT_SUFFIX')
+    _multiarch = sysconfig.get_config_var ('MULTIARCH')
+    if ext_suffix.endswith(_multiarch + ext_suffix[-3:]):
+        new_suffix = None
+    else:
+        new_suffix = "%s-%s%s" % (ext_suffix[:-3], _multiarch, ext_suffix[-3:])
+
+    if not dry_run:
+        mkpath(dst, verbose=verbose)
+
+    outputs = []
+
+    for n in names:
+        src_name = os.path.join(src, n)
+        dst_name = os.path.join(dst, n)
+        if new_suffix and _multiarch and n.endswith(ext_suffix) and not n.endswith(new_suffix):
+            dst_name = os.path.join(dst, n.replace(ext_suffix, new_suffix))
+            log.info("renaming extension %s -> %s", n, n.replace(ext_suffix, new_suffix))
+
+        if n.startswith('.nfs'):
+            # skip NFS rename files
+            continue
+
+        if preserve_symlinks and os.path.islink(src_name):
+            link_dest = os.readlink(src_name)
+            if verbose >= 1:
+                log.info("linking %s -> %s", dst_name, link_dest)
+            if not dry_run:
+                os.symlink(link_dest, dst_name)
+            outputs.append(dst_name)
+
+        elif os.path.isdir(src_name):
+            outputs.extend(
+                copy_tree(src_name, dst_name, preserve_mode,
+                          preserve_times, preserve_symlinks, update,
+                          verbose=verbose, dry_run=dry_run))
+        else:
+            copy_file(src_name, dst_name, preserve_mode,
+                      preserve_times, update, verbose=verbose,
+                      dry_run=dry_run, link="sym")
+            outputs.append(dst_name)
+
+    return outputs
